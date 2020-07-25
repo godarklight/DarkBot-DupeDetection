@@ -22,14 +22,17 @@ namespace DarkBot.DupeDetection
         private DiscordSocketClient _client;
         private Backup _backup;
         private Dictionary<string, string> hashes = new Dictionary<string, string>();
-        private Dictionary<string, string> reverse_hashes = new Dictionary<string, string>();
+        private Dictionary<ulong, ulong> channel_to_server = new Dictionary<ulong, ulong>();
+        private Dictionary<ulong, Dictionary<string, string>> reverse_hashes = new Dictionary<ulong, Dictionary<string, string>>();
         private string backupPath = Path.Combine(Environment.CurrentDirectory, "Backup");
         private string dupePath = Path.Combine(Environment.CurrentDirectory, "Duplicate");
         private string dupeDBPath = Path.Combine(Environment.CurrentDirectory, "Duplicate", "hashes.txt");
         private ConcurrentQueue<string> hashQueue = new ConcurrentQueue<string>();
+        private ConcurrentQueue<NotifyMessage> notifyQueue = new ConcurrentQueue<NotifyMessage>();
 
         private const int RESIZE_HEIGHT = 32;
         private const int RESIZE_WIDTH = 32;
+        private bool ready;
 
 
         public Task Initialize(IServiceProvider services)
@@ -43,11 +46,18 @@ namespace DarkBot.DupeDetection
                 Directory.CreateDirectory(dupePath);
             }
             _client = (DiscordSocketClient)services.GetService(typeof(DiscordSocketClient));
+            _client.Ready += OnReady;
             _backup = (Backup)services.GetService(typeof(Backup));
             _backup.PictureEvent += CheckPicture;
             Task lph = Task.Run(LoadPictureHashes);
             Task hs = Task.Run(HashingService);
-            hs.Wait();
+            Task ns = Task.Run(NotifyService);
+            return Task.CompletedTask;
+        }
+
+        public Task OnReady()
+        {
+            ready = true;
             return Task.CompletedTask;
         }
 
@@ -67,13 +77,19 @@ namespace DarkBot.DupeDetection
                     string lhs = currentLine.Substring(0, currentLine.IndexOf("="));
                     string rhs = currentLine.Substring(currentLine.IndexOf("=") + 1);
                     hashes[lhs] = rhs;
-                    if (!reverse_hashes.ContainsKey(rhs))
+                    ulong channelID = GetChannelIDFromPath(lhs);
+                    if (!reverse_hashes.ContainsKey(channelID))
                     {
-                        reverse_hashes[rhs] = lhs;
+                        reverse_hashes.Add(channelID, new Dictionary<string, string>());
+                    }
+                    if (!reverse_hashes[channelID].ContainsKey(rhs))
+                    {
+                        reverse_hashes[channelID][rhs] = lhs;
                     }
                     else
                     {
-                        Console.WriteLine($"Dupe: {lhs} matches {reverse_hashes[rhs]}");
+                        string existingFile = reverse_hashes[channelID][rhs];
+                        Console.WriteLine($"Dupe (loaded): {lhs} matches {existingFile}");
                     }
                 }
             }
@@ -104,6 +120,71 @@ namespace DarkBot.DupeDetection
                 if (!hashes.ContainsKey(backupFileClipped) && (backupFileClipped.EndsWith(".jpg") || backupFileClipped.EndsWith(".png")))
                 {
                     hashQueue.Enqueue(backupFileClipped);
+                }
+            }
+        }
+
+        public async void NotifyService()
+        {
+            while (!ready)
+            {
+                await Task.Delay(1000);
+            }
+            while (true)
+            {
+                await Task.Delay(1000);
+                if (notifyQueue.TryDequeue(out NotifyMessage notifyMessage))
+                {
+                    ulong channelID = notifyMessage.channelID;
+                    ulong originalMessageID = notifyMessage.originalMessageID;
+                    ulong repostMessageID = notifyMessage.repostMessageID;
+                    ulong serverID = 0;
+                    if (channel_to_server.ContainsKey(notifyMessage.channelID))
+                    {
+                        serverID = channel_to_server[notifyMessage.channelID];
+                    }
+                    else
+                    {
+                        foreach (SocketGuild findGuild in _client.Guilds)
+                        {
+                            foreach (SocketGuildChannel findChannel in findGuild.Channels)
+                            {
+                                if (!channel_to_server.ContainsKey(findChannel.Id))
+                                {
+                                    channel_to_server[findChannel.Id] = findGuild.Id;
+                                }
+                            }
+                        }
+                        if (channel_to_server.ContainsKey(channelID))
+                        {
+                            serverID = channel_to_server[channelID];
+                        }
+                        else
+                        {
+                            Console.WriteLine("Failed to get channel ID");
+                        }
+                    }
+                    if (serverID != 0)
+                    {
+                        SocketGuild sg = _client.GetGuild(serverID);
+                        SocketTextChannel sgc = sg.GetChannel(channelID) as SocketTextChannel;
+                        IMessage messageOriginal = await sgc.GetMessageAsync(originalMessageID);
+                        IMessage messageNew = await sgc.GetMessageAsync(repostMessageID);
+                        foreach (SocketGuildChannel possibleChannel in sg.Channels)
+                        {
+                            SocketTextChannel possibleTextChannel = possibleChannel as SocketTextChannel;
+                            if (possibleTextChannel == null)
+                            {
+                                continue;
+                            }
+                            if (possibleTextChannel.Name == "reposts")
+                            {
+                                await possibleTextChannel.SendMessageAsync($"Original: <{messageOriginal.GetJumpUrl()}>, Repost: <{messageNew.GetJumpUrl()}>");
+                                break;
+                            }
+                        }
+                    }
+                    await Task.Delay(10000);
                 }
             }
         }
@@ -146,14 +227,21 @@ namespace DarkBot.DupeDetection
                         }
                     }
                     string base64String = GetBase64String(picHash);
+                    ulong thisChannel = GetChannelIDFromPath(fileToHash);
                     hashes[fileToHash] = base64String;
-                    if (reverse_hashes.ContainsKey(base64String))
+                    if (!reverse_hashes.ContainsKey(thisChannel))
                     {
-                        Console.WriteLine($"MATCH {fileToHash}, hash: {base64String}, existing file {reverse_hashes[base64String]}");
+                        reverse_hashes.Add(thisChannel, new Dictionary<string, string>());
+                    }
+                    if (reverse_hashes[thisChannel].ContainsKey(base64String))
+                    {
+                        string existingFile = reverse_hashes[thisChannel][base64String];
+                        NotifyRepost(thisChannel, GetMessageIDFromPath(existingFile), GetMessageIDFromPath(fileToHash));
+                        Console.WriteLine($"MATCH {fileToHash}, hash: {base64String}, existing file {existingFile}");
                     }
                     else
                     {
-                        reverse_hashes[base64String] = fileToHash;
+                        reverse_hashes[thisChannel][base64String] = fileToHash;
                     }
                     GC.Collect();
                     Console.WriteLine($"{fileToHash}={base64String}");
@@ -179,6 +267,18 @@ namespace DarkBot.DupeDetection
             return System.Convert.ToBase64String(input);
         }
 
+        public static ulong GetChannelIDFromPath(string filePath)
+        {
+            string[] channelIDString = filePath.Split(Path.DirectorySeparatorChar);
+            return ulong.Parse(channelIDString[1]);
+        }
+        public static ulong GetMessageIDFromPath(string filePath)
+        {
+            string[] channelIDString = filePath.Split(Path.DirectorySeparatorChar);
+            string messagePart = channelIDString[2];
+            string messageID = messagePart.Split('-')[0];
+            return ulong.Parse(messageID);
+        }
         public static Bitmap ResizeImage(SystemImage image)
         {
             var destRect = new Rectangle(0, 0, RESIZE_WIDTH, RESIZE_HEIGHT);
@@ -202,6 +302,12 @@ namespace DarkBot.DupeDetection
             }
 
             return destImage;
+        }
+
+        public void NotifyRepost(ulong channelID, ulong originalMessage, ulong newMessage)
+        {
+            NotifyMessage nm = new NotifyMessage(channelID, originalMessage, newMessage);
+            notifyQueue.Enqueue(nm);
         }
     }
 }

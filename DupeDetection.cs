@@ -90,7 +90,7 @@ namespace DarkBot.DupeDetection
             }
         }
 
-        public Task MessageDeleted(Cacheable<IMessage, ulong> cacheable, ISocketMessageChannel channel)
+        public Task MessageDeleted(Cacheable<IMessage, ulong> cacheable, Cacheable<IMessageChannel, ulong> channel)
         {
             if (cacheable.HasValue)
             {
